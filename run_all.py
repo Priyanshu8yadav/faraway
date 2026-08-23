@@ -111,7 +111,26 @@ def task_parse_datasets(cfg: dict) -> Path:
 # ── Task C: Calibrate κ(β) ────────────────────────────────────────────────────
 
 def task_calibrate_kappa(cfg: dict, all_csv: Path) -> dict:
-    """Build calibration dataset and fit κ(β)."""
+    """DISABLED — this task produced a broken calibration.
+
+    build_from_parser_csv() sets `detected` = ground-truth count, so the
+    resulting κ_obs is ≡1.0 and the fit is meaningless (it railed to the
+    optimizer bounds and logged a nonsense 'R²=1.0000'). The real occlusion
+    calibration is done by the SAHI head-detection scripts; the canonical
+    result lives in outputs/calibration/kappa_params_density.json (R²=0.6152).
+    Reproduce it with:  python verify_kappa.py
+
+    This guard prevents the broken path from regenerating garbage and
+    overwriting the real params. See README_CALIBRATION.md.
+    """
+    logger.warning("Task C (run_all κ calibration) is DISABLED — it copied "
+                   "ground truth as detections. Use verify_kappa.py instead.")
+    return {"alpha0": 8.2442, "gamma": 1.1333, "metrics": {"r2": 0.6152},
+            "disabled": True, "canonical": "outputs/calibration/kappa_params_density.json"}
+
+
+def _task_calibrate_kappa_BROKEN_DO_NOT_USE(cfg: dict, all_csv: Path) -> dict:
+    """Original broken implementation, kept only for reference. Never called."""
     kappa_cfg = cfg["kappa"]
     out_cal   = Path(cfg["outputs"]["calibration"])
 

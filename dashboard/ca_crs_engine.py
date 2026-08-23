@@ -3,7 +3,7 @@ ca_crs_engine.py
 ────────────────
 Core CA-CRS⁺ risk scoring engine — paper-aligned (Modules 2–6).
 
-Module 2  — Detection & Occlusion Correction: κ(ρ) = 1 + α₀·ρ^γ
+Module 2  — Detection & Occlusion Correction: κ(ρ) = 1 + α₀·ρ^γb
 Module 3  — Non-linear risk score + causal attribution r_f
 Module 4  — Cause-to-gate mapping + ripple-effect prevention (threshold > 0.50)
 Module 5  — Logarithmic marshal demand: D_mar = ⌈α_l · log₁₀(1 + N_k)⌉
@@ -25,6 +25,7 @@ import cv2
 import numpy as np
 
 from dashboard.threaded_stream import ThreadedStream
+from dashboard.forecasting import ZoneForecaster, ForecastResult
 
 # ── Module 2: Calibrated κ(ρ) constants ──────────────────────────────────────
 KAPPA_ALPHA0  = 8.2442
@@ -47,6 +48,12 @@ CAPACITY  = int(RHO_MAX * AREA_M2)  # = 350 heads — used as ρ denominator
 
 # ── Speed saturation ──────────────────────────────────────────────────────────
 V_MAX = 15.0   # px/frame speed saturation (from config.yaml physics.v_max)
+
+# ── Optical-flow constants (Module 2 motion, paper eqs. 1–2) ──────────────────
+# Dense Farneback flow is computed on the YOLO-sized grayscale frame. A pixel is
+# considered "moving" if its flow magnitude exceeds this threshold (px/frame);
+# static background is excluded so speed/conflict reflect the crowd, not noise.
+FLOW_MOVING_THRESH = 0.6   # px/frame — below this a pixel is treated as static
 
 # ── Risk thresholds ───────────────────────────────────────────────────────────
 THRESHOLD_WARN   = 0.35
@@ -89,6 +96,7 @@ class ZoneState:
     head_count:      int   = 0
     corrected_count: int   = 0
     kappa:           float = 1.0
+    count_mode:      str   = "dmcount"   # "dmcount" | "yolo"
     gate_cmd:        str   = "HOLD"
     gate_color:      str   = "#22c55e"
     status:          str   = "SAFE"
@@ -100,6 +108,14 @@ class ZoneState:
     speed_history:    list[float] = field(default_factory=list)
     conflict_history: list[float] = field(default_factory=list)
     frame_rgb:        Optional[np.ndarray] = None
+
+    # ── Module 7: Predictive layer (Holt linear-trend forecast) ───────────────
+    forecast_level:     float = 0.0    # ℓ_t smoothed current risk
+    forecast_trend:     float = 0.0    # risk velocity, per second
+    forecast_curve:     list  = field(default_factory=list)  # projected CRS
+    forecast_times:     list  = field(default_factory=list)  # seconds-ahead
+    forecast_direction: str   = "flat"  # rising | falling | flat
+    eta_danger_seconds: Optional[float] = None   # projected time to DANGER, or None
 
 
 # ── Module 2: κ(ρ) occlusion correction ──────────────────────────────────────
@@ -204,10 +220,14 @@ class ZoneProcessor:
         zone_id:      str,
         label:        str,
         video_source: str,
-        model,
+        model=None,
         conf:         float = 0.25,
         imgsz:        int   = 640,
         target_fps:   int   = 8,
+        counter=None,                 # shared DMCountCounter (density-map mode)
+        count_mode:   str   = "dmcount",   # "dmcount" | "yolo"
+        count_min_interval: float = 0.6,   # min seconds between heavy DM-Count runs
+        capacity:     int   = CAPACITY,    # safe occupancy of this zone (D_norm denom)
     ):
         self.zone_id = zone_id
         self.label   = label
@@ -219,50 +239,84 @@ class ZoneProcessor:
         self.conf    = conf
         self.imgsz   = imgsz
 
+        # ── Counting engine (density-map by default) ─────────────────────────
+        self.counter    = counter
+        self.count_mode = count_mode
+        self.count_min_interval = count_min_interval
+        self.capacity   = int(capacity)
+        self._last_count   = 0
+        self._last_heat:  Optional[np.ndarray] = None   # precomputed color heatmap
+        self._last_alpha: Optional[np.ndarray] = None   # precomputed blend weights
+        self._last_count_t = 0.0
+
         src_fps = self._stream.fps
         self._frame_skip  = max(1, int(src_fps / target_fps))
         self._frame_count = 0
 
-        self._prev_positions: np.ndarray = np.zeros((0, 2))
+        # Previous grayscale frame for dense optical flow (Module 2 motion).
+        self._prev_gray: Optional[np.ndarray] = None
         self._prev_time = time.time()
+
+        # Module 7: per-zone predictive forecaster over the CRS signal.
+        self._forecaster = ZoneForecaster(danger_threshold=THRESHOLD_DANGER)
+
         self.state = ZoneState(zone_id=zone_id, label=label)
 
-    # ── Speed estimation ──────────────────────────────────────────────────────
-    def _estimate_speed(self, curr_boxes: np.ndarray) -> float:
-        """Frame-to-frame centroid displacement → S_norm.
-        Normalized by V_MAX (15.0 px/frame from config.yaml physics.v_max).
-        """
-        if len(curr_boxes) == 0:
-            self._prev_positions = np.zeros((0, 2))
-            return 0.0
-        curr_c = np.stack([
-            (curr_boxes[:, 0] + curr_boxes[:, 2]) / 2,
-            (curr_boxes[:, 1] + curr_boxes[:, 3]) / 2,
-        ], axis=1)
-        if len(self._prev_positions) == 0:
-            self._prev_positions = curr_c
-            return 0.0
-        n = min(len(curr_c), len(self._prev_positions))
-        dists = np.linalg.norm(curr_c[:n] - self._prev_positions[:n], axis=1)
-        speed_px = float(dists.mean()) if n > 0 else 0.0
-        self._prev_positions = curr_c
-        return float(np.clip(speed_px / V_MAX, 0.0, 1.0))
+    # ── Motion features from dense optical flow (paper eqs. 1–2) ──────────────
+    def _flow_features(self, gray: np.ndarray) -> tuple[float, float]:
+        """Dense Farneback optical flow → (S_norm, C_raw).
 
-    # ── Conflict estimation ───────────────────────────────────────────────────
-    def _estimate_conflict(self, boxes: np.ndarray) -> float:
-        """IQR-based conflict proxy for bidirectional / intersecting flow.
-        Uses inter-quartile range ratio — robust, doesn't self-cancel to zero.
+        This replaces the old centroid-index speed and IQR conflict, both of
+        which were wrong:
+          - the old speed matched detections *by array position* across frames,
+            i.e. it measured the distance between unrelated heads (pure noise);
+          - the old conflict was horizontal spread, so a wide orderly crowd
+            scored as 'conflict'.
+
+        S_norm  (paper eq. 1): mean flow magnitude over MOVING pixels, normalised
+                 by V_MAX. Static background is excluded so a still crowd reads 0.
+
+        C_raw   (paper eq. 2): magnitude-weighted circular variance of flow
+                 DIRECTION,  C = 1 − |Σ mᵢ·e^{jθᵢ}| / Σ mᵢ.
+                 Aligned flow  ⇒ C→0;  balanced counter-flow ⇒ C→1. Unlike the
+                 old IQR proxy this is maximal for true opposing flows and does
+                 NOT vanish at a 50/50 split.
         """
-        if len(boxes) < 4:
-            return 0.0
-        cx = boxes[:, 0] + (boxes[:, 2] - boxes[:, 0]) / 2
-        q75, q25 = np.percentile(cx, [75, 25])
-        span = cx.max() - cx.min() + 1e-3
-        iqr_ratio = (q75 - q25) / span
-        return float(np.clip(iqr_ratio * 2.0, 0.0, 1.0))
+        prev = self._prev_gray
+        self._prev_gray = gray
+        if prev is None or prev.shape != gray.shape:
+            return 0.0, 0.0
+
+        # Dense flow (Farneback). Cheap on the already-downscaled YOLO frame.
+        flow = cv2.calcOpticalFlowFarneback(
+            prev, gray, None,
+            pyr_scale=0.5, levels=3, winsize=15,
+            iterations=3, poly_n=5, poly_sigma=1.2, flags=0,
+        )
+        fx, fy = flow[..., 0], flow[..., 1]
+        mag = np.sqrt(fx * fx + fy * fy)
+
+        moving = mag > FLOW_MOVING_THRESH
+        n_moving = int(moving.sum())
+        if n_moving == 0:
+            return 0.0, 0.0
+
+        # ── S_norm: mean speed over moving pixels, saturated at V_MAX ─────────
+        s_norm = float(np.clip(mag[moving].mean() / V_MAX, 0.0, 1.0))
+
+        # ── C_raw: magnitude-weighted circular variance of direction ─────────
+        m = mag[moving]
+        theta = np.arctan2(fy[moving], fx[moving])
+        resultant = np.abs(np.sum(m * np.exp(1j * theta)))
+        c_raw = float(np.clip(1.0 - resultant / (m.sum() + 1e-9), 0.0, 1.0))
+
+        return s_norm, c_raw
 
     # ── Main frame processing ─────────────────────────────────────────────────
-    def process_frame(self) -> ZoneState:
+    def process_frame(self, do_count: bool = True) -> ZoneState:
+        """do_count=False → skip the heavy DM-Count inference this tick and
+        reuse the last density result (round-robin scheduling). Motion, risk,
+        forecast and the display still update every tick."""
         t0 = time.time()
 
         ok, frame = self._stream.read()
@@ -273,44 +327,72 @@ class ZoneProcessor:
         if self._frame_count % self._frame_skip != 0:
             return self.state
 
-        # ── YOLO inference ────────────────────────────────────────────────────
-        try:
-            # Pre-resize to imgsz before model.predict() — reduces memory bandwidth
-            h0, w0 = frame.shape[:2]
-            scale   = self.imgsz / max(h0, w0)
-            frame_s = cv2.resize(frame, (int(w0 * scale), int(h0 * scale)))
-            results = self.model.predict(
-                frame_s, conf=self.conf, imgsz=self.imgsz, verbose=False
-            )[0]
-            # Scale boxes back to original resolution for annotation
-            if results.boxes and len(results.boxes):
-                boxes_s = results.boxes.xyxy.cpu().numpy()
-                boxes   = boxes_s / scale
+        h0, w0 = frame.shape[:2]
+        boxes   = np.zeros((0, 4))   # only populated in YOLO mode
+        overlay = None               # density heatmap frame in DM-Count mode
+
+        if self.count_mode == "dmcount" and self.counter is not None:
+            # ── DM-Count density regression (paper counting front end) ────────
+            # Regresses a continuous density map and integrates it → true count.
+            # No occlusion correction needed: unlike detection it does not
+            # under-count in dense crowds. Heavy, so throttled per zone.
+            now = time.time()
+            # Run the heavy inference only when it is this zone's turn (do_count)
+            # AND the min interval elapsed — but always run once at startup so the
+            # first frame has a result.
+            need = self._last_heat is None or (
+                do_count and (now - self._last_count_t) >= self.count_min_interval
+            )
+            if need:
+                try:
+                    count, heat, alpha = self.counter.infer(frame)
+                    self._last_count = count
+                    self._last_heat, self._last_alpha = heat, alpha
+                    self._last_count_t = now
+                except Exception:
+                    count = self._last_count
             else:
+                count = self._last_count
+            # Re-blend the last heatmap onto the CURRENT frame every tick → the
+            # video stays live and smooth even between heavy inferences.
+            overlay = self.counter.compose(frame, self._last_heat, self._last_alpha)
+            head_count      = count      # regressed count (no separate "raw")
+            corrected_count = count      # nothing to correct
+            kap             = 1.0        # κ not applied in density-regression mode
+        else:
+            # ── YOLO detection + κ(ρ) occlusion correction (fallback) ─────────
+            try:
+                scale   = self.imgsz / max(h0, w0)
+                frame_s = cv2.resize(frame, (int(w0 * scale), int(h0 * scale)))
+                results = self.model.predict(
+                    frame_s, conf=self.conf, imgsz=self.imgsz, verbose=False
+                )[0]
+                if results.boxes and len(results.boxes):
+                    boxes = results.boxes.xyxy.cpu().numpy() / scale
+            except Exception:
                 boxes = np.zeros((0, 4))
-        except Exception:
-            boxes = np.zeros((0, 4))
-
-        head_count = len(boxes)
-
-        # ── Module 2: κ(ρ) correction ────────────────────────────────────────
-        # ρ = per-zone density ratio = detected_heads / zone_capacity (350)
-        rho              = head_count / CAPACITY
-        kap              = kappa(rho)
-        corrected_count  = int(head_count * kap)
+            head_count      = len(boxes)
+            rho             = head_count / self.capacity
+            kap             = kappa(rho)
+            corrected_count = int(head_count * kap)
 
         # ── Module 3: Normalized feature inputs ──────────────────────────────
-        D_norm = float(np.clip(corrected_count / CAPACITY, 0.0, 1.0))
-        S_norm = self._estimate_speed(boxes)
+        D_norm = float(np.clip(corrected_count / self.capacity, 0.0, 1.0))
+
+        # Motion features from dense optical flow (paper eqs. 1–2). Computed on a
+        # flow-dedicated grayscale so it is independent of the counting engine.
+        flow_scale = 640.0 / max(w0, 1)
+        gray = cv2.cvtColor(
+            cv2.resize(frame, (int(w0 * flow_scale), int(h0 * flow_scale))),
+            cv2.COLOR_BGR2GRAY,
+        )
+        S_norm, C_raw = self._flow_features(gray)
 
         # C_norm reliability gate (paper, Module 3):
         # At density ≥6 persons/m² (D_norm ≥ 0.857), optical flow breaks down
         # entirely due to body occlusion — C_norm becomes meaningless noise.
         # Zero it out so only Density drives attribution in crush conditions.
-        if D_norm >= C_UNRELIABLE_DENSITY_NORM:
-            C_norm = 0.0
-        else:
-            C_norm = self._estimate_conflict(boxes)
+        C_norm = 0.0 if D_norm >= C_UNRELIABLE_DENSITY_NORM else C_raw
 
         risk_val = compute_risk(D_norm, S_norm, C_norm)
         status, color = classify(risk_val)
@@ -327,9 +409,13 @@ class ZoneProcessor:
             gate_cmd, gate_color = CAUSE_GATE_MAP[dominant_cause]
 
         # ── Annotate frame ────────────────────────────────────────────────────
+        # DM-Count mode draws the HUD over the density heatmap; YOLO mode over
+        # the raw frame with boxes.
+        base_vis = overlay if (overlay is not None) else frame
         frame_ann = self._annotate(
-            frame.copy(), boxes, risk_val, status, color,
-            head_count, corrected_count, dominant_cause, causal_ratios
+            base_vis.copy(), boxes, risk_val, status, color,
+            head_count, corrected_count, dominant_cause, causal_ratios,
+            mode=self.count_mode,
         )
         frame_rgb = cv2.cvtColor(frame_ann, cv2.COLOR_BGR2RGB)
 
@@ -347,6 +433,7 @@ class ZoneProcessor:
         s.head_count      = head_count
         s.corrected_count = corrected_count
         s.kappa           = round(kap, 3)
+        s.count_mode      = self.count_mode
         s.status          = status
         s.color           = color
         s.gate_cmd        = gate_cmd
@@ -361,12 +448,21 @@ class ZoneProcessor:
         s.speed_history    = (s.speed_history    + [S_norm  ])[-MAXHIST:]
         s.conflict_history = (s.conflict_history + [C_norm  ])[-MAXHIST:]
 
+        # ── Module 7: Predictive layer — forecast + time-to-DANGER ETA ────────
+        fc: ForecastResult = self._forecaster.update(risk_val)
+        s.forecast_level     = fc.level
+        s.forecast_trend     = fc.trend_per_sec
+        s.forecast_curve     = fc.forecast_curve
+        s.forecast_times     = fc.forecast_times
+        s.forecast_direction = fc.direction
+        s.eta_danger_seconds = fc.eta_seconds
+
         return s
 
     # ── Frame annotation ──────────────────────────────────────────────────────
     def _annotate(
         self, frame, boxes, risk, status, color,
-        raw_count, corr_count, dominant_cause, causal_ratios
+        raw_count, corr_count, dominant_cause, causal_ratios, mode="dmcount"
     ):
         h, w = frame.shape[:2]
         c = {"SAFE": (34, 197, 94), "WARNING": (245, 158, 11), "DANGER": (239, 68, 68)}[status]
@@ -374,7 +470,7 @@ class ZoneProcessor:
         # Coloured border
         cv2.rectangle(frame, (0, 0), (w, h), c, 14)
 
-        # Bounding boxes
+        # Bounding boxes (YOLO mode only; DM-Count shows the heatmap instead)
         for box in boxes:
             x1, y1, x2, y2 = map(int, box[:4])
             cv2.rectangle(frame, (x1, y1), (x2, y2), c, 2)
@@ -386,8 +482,11 @@ class ZoneProcessor:
 
         font = cv2.FONT_HERSHEY_DUPLEX
         dom_pct = causal_ratios.get(dominant_cause, 0.0) * 100
-        cv2.putText(frame, f"Heads: {raw_count}  Corr: {corr_count}",
-                    (12, 28), font, 0.65, (255, 255, 255), 1)
+        if mode == "dmcount":
+            count_txt = f"People: {corr_count}  (DM-Count density)"
+        else:
+            count_txt = f"Heads: {raw_count} -> {corr_count} (kappa)"
+        cv2.putText(frame, count_txt, (12, 28), font, 0.65, (255, 255, 255), 1)
         cv2.putText(frame, f"CRS: {risk:.3f}  [{status}]",
                     (12, 58), font, 0.85, c, 2)
         cv2.putText(frame, f"Cause: {dominant_cause} ({dom_pct:.0f}%)",

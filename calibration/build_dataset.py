@@ -19,7 +19,7 @@ they are loaded directly.  Otherwise, the parser CSVs are used as a proxy
 (bounding boxes available for PETS2009; dot annotations for ShanghaiTech/UCF-QNRF).
 
 Output schema
-─────────────
+─────────────yut
 image_id      : str    — unique identifier
 dataset       : str    — source dataset name
 split         : str    — train | test

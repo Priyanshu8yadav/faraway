@@ -1,3 +1,9 @@
+# ─────────────────────────────────────────────────────────────
+#  CA-CRS⁺  ·  .gitignore
+#  Keeps the repo lean: code + configs + docs are tracked;
+#  weights, datasets, videos, caches and scratch are not.
+# ─────────────────────────────────────────────────────────────
+
 # Python
 __pycache__/
 *.py[cod]
@@ -6,22 +12,28 @@ __pycache__/
 dist/
 build/
 *.egg
+.pytest_cache/
 
-# Virtual environment
+# Virtual environments
 .venv/
 venv/
 env/
+ENV/
 
-# Large model weights — download separately via HuggingFace
-models/*.pt
-models/*.onnx
-models/*.engine
+# Model weights — download separately (see models/README.md)
+# NOTE: matches .pt, .pth, .onnx, .engine AND the split _parts_tmp/ chunks.
+models/*
+!models/README.md
+!models/.gitkeep
 
-# Large output / calibration data (too big for GitHub)
-outputs/calibration/yolo_calibration_dataset.csv
+# Datasets — obtained separately (ShanghaiTech / UCF-QNRF / PETS2009)
+datasets/*
+!datasets/.gitkeep
+
+# Large computed outputs (calibration dumps, per-image tables, figures)
 outputs/
 
-# Video files — ignored globally, but public/ folder is excluded from this rule
+# Video files — ignored globally; sample videos in public/ are allowed
 *.mp4
 *.avi
 *.mov
@@ -31,19 +43,21 @@ outputs/
 !public/*.mov
 !public/*.mkv
 
+# Round-1 scratch / quarantined broken artifacts — never push these
+_QUARANTINE_broken_round1/
+dashboard/original_run_dashboard.py
+
 # Jupyter
 .ipynb_checkpoints/
-
-# macOS
-.DS_Store
-
-# IDE
-.idea/
-.vscode/
-*.swp
 
 # Streamlit cache
 .streamlit/
 
 # Logs
 *.log
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+*.swp

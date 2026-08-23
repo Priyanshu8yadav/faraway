@@ -18,6 +18,7 @@ import numpy as np
 import plotly.graph_objects as go
 import psutil
 import streamlit as st
+import streamlit.components.v1 as components
 
 # ── Path fix so we can import project modules ─────────────────────────────────
 ROOT = Path(__file__).resolve().parent.parent
@@ -33,6 +34,8 @@ from dashboard.virtual_plc import (
     start_plc_server, write_gate, write_emergency_open,
     read_all_gates, is_plc_running,
 )
+from dashboard import accessibility as a11y
+from dashboard import responders as rsp
 
 import math
 
@@ -167,7 +170,20 @@ html, body, [class*="css"] {
 [data-testid="stSidebar"] { background: #070c18 !important; }
 [data-testid="stMetric"] { background: transparent; }
 .stPlotlyChart { border-radius: 12px; overflow: hidden; }
+/* Reserve chart height so a Plotly remount can't collapse the slot to 0px and
+   jump the whole page (the flicker/scroll-jump symptom). */
+[data-testid="stPlotlyChart"] { min-height: 180px; }
 div[data-testid="stImage"] img { border-radius: 10px; }
+
+/* ── Kill the "dim then bright" pulse ──────────────────────────────────────
+   Streamlit fades elements to a low opacity while a rerun is in flight; with a
+   live fragment reruning constantly this reads as flicker. Force full opacity
+   and remove the opacity transition so updates are instant, not a fade. */
+[data-stale="true"], .element-container[data-stale="true"],
+[data-testid="stImage"], [data-testid="stPlotlyChart"] { opacity: 1 !important; }
+.stApp [data-stale="true"] * { opacity: 1 !important; }
+.element-container, [data-testid="stImage"], [data-testid="stPlotlyChart"],
+[data-testid="stMarkdownContainer"] { transition: none !important; }
 
 /* Remove default padding */
 .block-container { padding-top: 1rem; padding-bottom: 0; }
@@ -297,12 +313,48 @@ with st.sidebar:
         VIDEO_B = st.text_input("Zone B Source", value=VIDEO_B)
         VIDEO_C = st.text_input("Zone C Source", value=VIDEO_C)
 
-        st.markdown('<div class="section-header">Detection Settings</div>',
+        st.markdown('<div class="section-header">Counting Engine</div>',
+                    unsafe_allow_html=True)
+        _eng = st.radio(
+            "Counting engine",
+            ["DM-Count (density map)", "YOLO (detection)"],
+            index=0, label_visibility="collapsed",
+            help="DM-Count regresses true crowd density (accurate in dense "
+                 "crowds, shows a heatmap). YOLO detects heads (fast, boxes, "
+                 "under-counts). DM-Count is the paper's counting method.",
+        )
+        count_engine = "dmcount" if _eng.startswith("DM-Count") else "yolo"
+        st.session_state.count_engine = count_engine
+
+        capacity = st.slider(
+            "Zone safe capacity (people)", 100, 2500, 800, 50,
+            help="People-per-zone that = 100% risk density. Tune to your camera "
+                 "view so scenes span SAFE→WARNING→DANGER.",
+        )
+        st.session_state.capacity = capacity
+
+        dm_res = st.select_slider(
+            "DM-Count resolution", [384, 448, 512, 640, 768], value=512,
+            help="Higher = more accurate, slower. Drop to 448/384 for speed; "
+                 "raise for accuracy. Restart (Stop→Start) to apply.",
+        )
+        st.session_state.dm_res = dm_res
+
+        st.markdown('<div class="section-header">Detection Settings (YOLO)</div>',
                     unsafe_allow_html=True)
         conf_thresh = st.slider("Confidence Threshold", 0.10, 0.60, 0.25, 0.05)
         imgsz       = st.select_slider("Inference Resolution", [320, 480, 640], value=480)
         target_fps  = st.slider("Target FPS", 2, 30, 6)
-        
+
+        _model_dir = ROOT / "models"
+        _pt_files  = sorted(p.name for p in _model_dir.glob("*.pt")) or ["yolov8n_crowd_head.pt"]
+        _default   = "yolov8n_crowd_head.pt" if "yolov8n_crowd_head.pt" in _pt_files else _pt_files[0]
+        model_choice = st.selectbox(
+            "Detector model (YOLO fallback)", _pt_files, index=_pt_files.index(_default),
+            help="Used only when Counting engine = YOLO.",
+        )
+        st.session_state.model_choice = model_choice
+
         st.markdown('<div class="section-header">Gate Control</div>',
                     unsafe_allow_html=True)
         auto_gate = st.toggle("Auto Gate Control", value=True)
@@ -310,31 +362,63 @@ with st.sidebar:
 
         st.markdown('<div class="section-header">Model Info</div>',
                     unsafe_allow_html=True)
+        _eng_txt = "DM-Count (VGG-19 density)" if count_engine == "dmcount" else f"YOLO · {model_choice}"
+        _dev = st.session_state.get("dm_device", "—")
+        _dev_color = "#22c55e" if _dev == "mps" else ("#f59e0b" if _dev == "cpu" else "#64748b")
         st.markdown(f"""
         <div style='font-size:12px; color:#64748b; font-family: JetBrains Mono, monospace;'>
-        κ(ρ) = 1 + {KAPPA_ALPHA0}·ρ^{KAPPA_GAMMA}<br>
-        R² = 0.615 &nbsp;|&nbsp; n=1,601 imgs<br>
-        Model: YOLOv8n + SAHI<br>
-        Datasets: SHTech A/B + UCF-QNRF
+        Counting: {_eng_txt}<br>
+        Compute: <span style='color:{_dev_color};font-weight:700'>{_dev}</span> &nbsp;(mps = fast)<br>
+        Capacity: {capacity} people/zone<br>
+        κ(ρ) R² = 0.615 (occlusion, validated)
         </div>""", unsafe_allow_html=True)
     else:
         # Default settings for Simple View
-        conf_thresh = 0.25
-        imgsz       = 480
-        target_fps  = 6
+        conf_thresh   = 0.25
+        imgsz         = 480
+        target_fps    = 6
+        count_engine  = st.session_state.get("count_engine", "dmcount")
+        capacity      = st.session_state.get("capacity", 800)
+        dm_res        = st.session_state.get("dm_res", 768)
+        model_choice  = st.session_state.get("model_choice", "yolov8n_crowd_head.pt")
+
+    # ── ♿ Accessibility (always visible, both views) ─────────────────────────
+    st.markdown('<div class="section-header">♿ Accessibility</div>', unsafe_allow_html=True)
+    st.caption("Make the alert reachable without relying on colour or sight.")
+    a11y_panel = st.toggle("Plain-language command panel", value=True,
+                           help="Large, high-contrast 'what's wrong · what to do' banner.")
+    a11y_cb    = st.toggle("Colour-blind-safe mode", value=False,
+                           help="Okabe–Ito palette + a distinct shape & word per status — never colour alone.")
+    a11y_large = st.toggle("Large text", value=False, help="Bigger command-panel text for low vision.")
+    a11y_audio = st.toggle("🔊 Spoken alerts (browser)", value=False,
+                           help="Reads new alerts aloud via the browser (offline). Click Start first to enable audio.")
+    a11y_say   = st.toggle("🔈 Speak on this machine (macOS)", value=False,
+                           help="Announce alerts out loud through this laptop's speakers (macOS 'say').")
+    a11y_rate  = st.slider("Voice speed", 0.7, 1.4, 1.0, 0.1) if (a11y_audio or a11y_say) else 1.0
+    for k, v in {"a11y_panel": a11y_panel, "a11y_cb": a11y_cb, "a11y_large": a11y_large,
+                 "a11y_audio": a11y_audio, "a11y_say": a11y_say, "a11y_rate": a11y_rate}.items():
+        st.session_state[k] = v
 
     st.markdown("---")
     start_btn = st.button("▶ Start Watching", width="stretch", type="primary")
     stop_btn  = st.button("⏹ Stop", width="stretch")
 
 
-# ── Load model (cached) ───────────────────────────────────────────────────────
+# ── Load models (cached) ──────────────────────────────────────────────────────
 @st.cache_resource(show_spinner="Loading YOLOv8 head detector…")
 def load_model(model_path: str):
     from ultralytics import YOLO
     return YOLO(model_path)
 
-MODEL_PATH = str(ROOT / "models" / "yolov8n_crowd_head.pt")
+@st.cache_resource(show_spinner="Loading DM-Count density model…")
+def load_dmcount(weights_path: str, longest_side: int):
+    from dashboard.dmcount_counter import DMCountCounter
+    return DMCountCounter(weights_path, longest_side=longest_side)
+
+# Detector chosen in the sidebar (Expert View); falls back to the n model.
+_chosen_model = st.session_state.get("model_choice", "yolov8n_crowd_head.pt")
+MODEL_PATH = str(ROOT / "models" / _chosen_model)
+DMCOUNT_WEIGHTS = str(ROOT / "models" / "model_qnrf.pth")
 
 
 # ── Helpers: source validation ─────────────────────────────────────────────────
@@ -375,6 +459,8 @@ def make_gauge(value: float, title: str, color: str) -> go.Figure:
     fig.update_layout(
         height=180, margin=dict(l=20, r=20, t=40, b=10),
         paper_bgcolor="#0a0e1a", font_color="#e2e8f0",
+        uirevision="grs",   # preserve view state across ticks → no flicker
+        transition_duration=0,
     )
     return fig
 
@@ -391,17 +477,44 @@ def make_risk_chart(states: list[ZoneState]) -> go.Figure:
         "zone_b": "#06b6d4",
         "zone_c": "#f59e0b",
     }
+    earliest_eta = None   # for the forecast annotation
     for s in states:
         if not s.risk_history:
             continue
         x = list(range(len(s.risk_history)))
+        color = LINE_COLORS.get(s.zone_id, "#6366f1")
         fig.add_trace(go.Scatter(
             x=x, y=s.risk_history, mode="lines",
             name=s.label,
-            line=dict(color=LINE_COLORS.get(s.zone_id, "#6366f1"), width=2.5),
+            line=dict(color=color, width=2.5),
             fill="tozeroy",
             fillcolor=FILL_COLORS.get(s.zone_id, "rgba(99,102,241,0.08)"),
         ))
+
+        # ── Module 7: dashed forecast continuation (projected risk) ───────────
+        fc = getattr(s, "forecast_curve", None)
+        if fc:
+            last_x = len(s.risk_history) - 1
+            fx = [last_x] + [last_x + i + 1 for i in range(len(fc))]
+            fy = [s.risk_history[-1]] + list(fc)
+            fig.add_trace(go.Scatter(
+                x=fx, y=fy, mode="lines",
+                name=f"{s.label} (forecast)",
+                line=dict(color=color, width=2, dash="dot"),
+                opacity=0.7, showlegend=False, hoverinfo="skip",
+            ))
+        eta = getattr(s, "eta_danger_seconds", None)
+        if eta is not None and (earliest_eta is None or eta < earliest_eta[0]):
+            earliest_eta = (eta, s.label)
+
+    if earliest_eta is not None:
+        fig.add_annotation(
+            xref="paper", yref="paper", x=0.99, y=0.98, xanchor="right",
+            text=f"⏱ Projected DANGER in ~{earliest_eta[0]:.0f}s  ({earliest_eta[1]})",
+            showarrow=False, font=dict(color="#ef4444", size=13, family="Inter"),
+            bgcolor="rgba(239,68,68,0.12)", bordercolor="#ef4444", borderwidth=1,
+            borderpad=4,
+        )
 
     fig.add_hline(y=THRESHOLD_WARN,   line=dict(color="#f59e0b", dash="dash", width=1.5),
                   annotation_text="⚠️ Getting Busy", annotation_position="top left",
@@ -419,6 +532,8 @@ def make_risk_chart(states: list[ZoneState]) -> go.Figure:
         legend=dict(bgcolor="#0f1628", bordercolor="#1e2d4a", borderwidth=1,
                     font=dict(size=11, color="#94a3b8")),
         font=dict(family="Inter"),
+        uirevision="timeline",   # preserve view state across ticks → no flicker
+        transition_duration=0,
     )
     return fig
 
@@ -479,13 +594,17 @@ def make_causal_chart(states: list[ZoneState]) -> go.Figure:
             text=" | ".join(dom_labels),
             font=dict(size=11, color="#94a3b8"), x=0.5,
         ),
+        uirevision="causal",   # preserve view state across ticks → no flicker
+        transition_duration=0,
     )
     return fig
 
 
 # ── Render: zone info card (below video) ──────────────────────────────────────
-def zone_info_html(s: ZoneState) -> str:
-    border = s.color
+def zone_info_html(s: ZoneState, colorblind: bool = False) -> str:
+    # Accessible status encoding — colour-blind-safe palette + distinct shape.
+    a_color, a_shape, _a_word = a11y.status_style(s.status, colorblind)
+    border = a_color if colorblind else s.color
     dom_pct = s.causal_ratios.get(s.dominant_cause, 0.0) * 100
     peak_color = "#ef4444" if s.peak_risk >= 0.70 else "#f59e0b" if s.peak_risk >= 0.35 else "#22c55e"
     # Compact HTML — no leading spaces on any line to prevent markdown code-block rendering
@@ -498,12 +617,19 @@ def zone_info_html(s: ZoneState) -> str:
         cause_str = s.dominant_cause
         pct_str   = f"({dom_pct:.0f}%)"
     fs = friendly_status(s.status)
+    if getattr(s, "count_mode", "dmcount") == "dmcount":
+        count_label, count_val = "People (DM-Count)", f"{s.corrected_count}"
+        third_label,  third_val  = "Density",           f"{s.density*100:.0f}%"
+    else:
+        count_label, count_val = "Heads (raw&rarr;corr)", f"{s.head_count} &rarr; {s.corrected_count}"
+        third_label,  third_val  = "&kappa;(&rho;)",        f"{s.kappa:.2f}"
     return (
         f"<div style='display:flex;justify-content:space-between;align-items:center;padding:6px 2px'>"
         f"<span style='font-weight:700;font-size:14px;color:#e2e8f0'>{s.label}</span>"
         f"<div style='display:flex;gap:6px;align-items:center'>"
         f"<span style='background:{border}22;color:{border};padding:2px 10px;border-radius:12px;"
-        f"font-size:11px;font-weight:700;border:1px solid {border}55'>{fs}</span>"
+        f"font-size:11px;font-weight:700;border:1px solid {border}55'>"
+        f"<span aria-hidden='true'>{a_shape}</span> {fs}</span>"
         f"<span style='background:#1e2d4a;color:{peak_color};padding:2px 8px;border-radius:10px;"
         f"font-size:10px;font-family:JetBrains Mono;border:1px solid {peak_color}44' "
         f"title='Session peak CRS score'>&#9650;{s.peak_risk:.3f}</span>"
@@ -514,13 +640,13 @@ def zone_info_html(s: ZoneState) -> str:
         f"<div style='font-size:20px;font-weight:800;font-family:JetBrains Mono;color:{border}'>{s.risk:.3f}</div>"
         f"</div>"
         f"<div style='flex:1;background:#0f1628;border-radius:8px;padding:8px 10px;border:1px solid #1e2d4a'>"
-        f"<div style='font-size:10px;color:#64748b'>Heads (raw&rarr;corr)</div>"
-        f"<div style='font-size:14px;font-weight:700;font-family:JetBrains Mono;color:#e2e8f0'>"
-        f"{s.head_count} &rarr; {s.corrected_count}</div>"
+        f"<div style='font-size:10px;color:#64748b'>{count_label}</div>"
+        f"<div style='font-size:18px;font-weight:800;font-family:JetBrains Mono;color:#e2e8f0'>"
+        f"{count_val}</div>"
         f"</div>"
         f"<div style='flex:1;background:#0f1628;border-radius:8px;padding:8px 10px;border:1px solid #1e2d4a'>"
-        f"<div style='font-size:10px;color:#64748b'>&kappa;(&rho;)</div>"
-        f"<div style='font-size:20px;font-weight:800;font-family:JetBrains Mono;color:#94a3b8'>{s.kappa:.2f}</div>"
+        f"<div style='font-size:10px;color:#64748b'>{third_label}</div>"
+        f"<div style='font-size:20px;font-weight:800;font-family:JetBrains Mono;color:#94a3b8'>{third_val}</div>"
         f"</div></div>"
         f"<div style='background:#0f1628;border-radius:6px;padding:6px 10px;"
         f"border:1px solid #1e2d4a;margin-top:4px;font-size:11px;color:#94a3b8;"
@@ -531,7 +657,61 @@ def zone_info_html(s: ZoneState) -> str:
         f"<span style='margin-left:auto;color:#64748b'>&rarr; Gate:</span>"
         f"<span style='color:#e2e8f0;font-family:JetBrains Mono;font-weight:700'>{s.gate_cmd}</span>"
         f"</div>"
+        # ── Module 7: predictive strip (trend + ETA) ──────────────────────────
+        + _forecast_strip_html(s)
     )
+
+
+def _forecast_strip_html(s: ZoneState) -> str:
+    """Small per-zone predictive readout: risk trend + time-to-DANGER ETA."""
+    eta = getattr(s, "eta_danger_seconds", None)
+    direction = getattr(s, "forecast_direction", "flat")
+    arrow = {"rising": "&#9650;", "falling": "&#9660;", "flat": "&#8226;"}.get(direction, "&#8226;")
+    dcol  = {"rising": "#ef4444", "falling": "#22c55e", "flat": "#64748b"}.get(direction, "#64748b")
+    if eta is not None:
+        right = (f"<span style='color:#f59e0b;font-weight:700'>DANGER in ~{eta:.0f}s</span>")
+    else:
+        right = "<span style='color:#475569'>no crossing projected</span>"
+    return (
+        f"<div style='background:#0f1628;border-radius:6px;padding:5px 10px;"
+        f"border:1px solid #1e2d4a;margin-top:4px;font-size:11px;"
+        f"display:flex;gap:6px;align-items:center'>"
+        f"<span style='color:#64748b'>Forecast:</span>"
+        f"<span style='color:{dcol};font-weight:700'>{arrow} {direction}</span>"
+        f"<span style='margin-left:auto'>{right}</span>"
+        f"</div>"
+    )
+
+
+# ── Render: responder Outbox (SMS-style live dispatch log) ────────────────────
+def outbox_html(outbox) -> str:
+    if not outbox:
+        return ("<div style='background:#0f1628;border:1px solid #1e2d4a;border-radius:10px;"
+                "padding:18px;color:#64748b;font-size:13px'>No alerts dispatched yet. "
+                "The moment a zone crosses into danger, the responsible marshal's phone "
+                "lights up here — and Control / Police / Medical on escalation.</div>")
+    cards = ""
+    for m in outbox[:8]:
+        accent = "#ef4444" if m.level == "DANGER" else "#f59e0b"
+        body = m.body.replace("\n", "<br>")
+        access = getattr(m, "access", "—")
+        a_badge = ""
+        if access and access not in ("—", "escalation"):
+            a_badge = (f"<span style='background:#312e81;color:#c7d2fe;font-size:10px;"
+                       f"padding:1px 7px;border-radius:8px;margin-left:6px'>&#9855; {access}</span>")
+        cards += (
+            f"<div style='background:#0f1628;border:1px solid #1e2d4a;border-radius:10px;"
+            f"padding:10px 12px;margin-bottom:8px'>"
+            f"<div style='display:flex;justify-content:space-between;align-items:center'>"
+            f"<span style='font-size:12px;color:#e2e8f0;font-weight:700'>&#128241; {m.to_name} "
+            f"<span style='color:#64748b;font-weight:400'>· {m.to_role} · {m.to_phone}</span>{a_badge}</span>"
+            f"<span style='font-size:10px;color:#22c55e;font-family:JetBrains Mono'>{m.status} · {m.ts}</span>"
+            f"</div>"
+            f"<div style='margin-top:6px;padding:8px 10px;background:#0a0e1a;border-radius:8px;"
+            f"border-left:3px solid {accent};font-size:11.5px;color:#cbd5e1;"
+            f"font-family:JetBrains Mono;line-height:1.45'>{body}</div>"
+            f"</div>")
+    return cards
 
 
 # ── Main dashboard loop (flicker-free with st.empty) ─────────────────────────
@@ -545,16 +725,27 @@ def run_dashboard(processors: list[ZoneProcessor]):
     col_title, col_tick = st.columns([8, 2])
     with col_title:
         st.markdown(f"""
-        <h1 class='hero-title' style='margin:0;font-size:28px;font-weight:800;'>
-            🛡️ Crowd Safety Watch
-        </h1>
-        <p style='margin:2px 0 0 0;font-size:13px;color:#64748b;'>
-            Live view of how crowded each area is — with automatic gates and clear advice
-        </p>""", unsafe_allow_html=True)
+        <div style='display:flex;align-items:center;gap:12px'>
+          <div style='font-size:30px'>🛡️</div>
+          <div>
+            <h1 class='hero-title' style='margin:0;font-size:26px;font-weight:800;letter-spacing:-0.5px;line-height:1'>
+              CA-CRS<span style='color:#6366f1'>⁺</span>
+              <span style='font-size:15px;font-weight:600;color:#94a3b8;letter-spacing:0'>Crowd Safety Intelligence</span>
+            </h1>
+            <p style='margin:3px 0 0 0;font-size:12px;color:#64748b;'>
+              Density-map counting · causal risk attribution · predictive crush forecast · autonomous gates
+            </p>
+          </div>
+        </div>""", unsafe_allow_html=True)
     ph_tick = col_tick.empty()
 
     st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-    
+
+    # ── ♿ Accessible Command Panel (Module 8) — the first thing on the page,
+    #    so it is also the first thing a screen reader reaches. ────────────────
+    ph_a11y     = st.empty()   # high-contrast plain-language command panel
+    ph_announce = st.empty()   # hidden aria-live region + TTS (fires on change)
+
     # Placeholder for Danger Banner
     ph_danger_banner = st.empty()
 
@@ -597,9 +788,9 @@ def run_dashboard(processors: list[ZoneProcessor]):
         # Static calibration expander
         with st.expander("📊 Calibration & Sensitivity Results", expanded=False):
             m1, m2, m3 = st.columns(3)
-            m1.metric("κ(ρ) R²", "0.615", "▲ vs YOLO-person")
+            m1.metric("κ(ρ) R²", "0.615", "reproducible from raw data")
             m2.metric("Head Det. Rate", "83.8%", "ShanghaiTech A")
-            m3.metric("PETS2009 Acc.", "75%", "DANGER classification")
+            m3.metric("β predictor R²", "−0.04", "rejected as useless")
             try:
                 kappa_params = json.loads(
                     (ROOT / "outputs/calibration/kappa_params_density.json").read_text()
@@ -653,6 +844,47 @@ def run_dashboard(processors: list[ZoneProcessor]):
                     unsafe_allow_html=True)
         ph_gate_log = right.empty()
 
+    # ── 📟 Module 9: Responder Alert & Escalation (accessible responder comms) ─
+    st.markdown('<div class="section-header">📟 Responder Alerts &amp; Escalation</div>',
+                unsafe_allow_html=True)
+    st.caption("A text message is the accessible channel for Deaf / hard-of-hearing marshals "
+               "and blind responders (their phone reads it aloud). Alerts route zone-by-zone, "
+               "and escalate to Control / Police / Medical on CRITICAL. Offline-simulated by "
+               "default (no network) — plug in an SMS gateway to send for real.")
+    st.session_state.setdefault("roster", [dict(r) for r in rsp.DEFAULT_ROSTER])
+    st.session_state.setdefault("outbox", [])
+    st.session_state.setdefault("_rsp_last", {})
+    rsp_cfg, rsp_out = st.columns([5, 7])
+    with rsp_cfg:
+        st.markdown("**Responder contacts** — edit live; alerts go to these numbers.")
+        st.session_state["roster"] = st.data_editor(
+            st.session_state["roster"], num_rows="dynamic", width="stretch",
+            key="roster_editor",
+            column_config={
+                "zone":   st.column_config.TextColumn("Zone", help="zone_a/b/c, or * for escalation", width="small"),
+                "name":   st.column_config.TextColumn("Name"),
+                "role":   st.column_config.TextColumn("Role", width="small"),
+                "phone":  st.column_config.TextColumn("Phone"),
+                "access": st.column_config.TextColumn("Accessibility need", help="Why text is their channel"),
+            })
+        _dm = st.radio("Dispatch mode", ["Simulated (offline)", "Live SMS gateway"],
+                       index=0, horizontal=True, key="disp_mode_radio")
+        st.session_state["dispatch_mode"] = "live" if _dm.startswith("Live") else "simulated"
+        st.caption(f"Gateway: {rsp.gateway_status(st.session_state['dispatch_mode'])}")
+        test_btn = st.button("📨 Test dispatch (simulate Central Plaza DANGER)", width="stretch")
+    with rsp_out:
+        st.markdown("**Outbox — live dispatch log**")
+        ph_outbox = st.empty()
+
+    if test_btn:
+        _demo = ZoneState(zone_id="zone_b", label="Central Plaza")
+        _demo.status = "DANGER"; _demo.risk = 0.95; _demo.dominant_cause = "Density"
+        _demo.gate_cmd = "OPEN"; _demo.eta_danger_seconds = 8
+        _m = rsp.build_messages([_demo], st.session_state["roster"], time.strftime("%H:%M:%S"))
+        rsp.dispatch(_m, st.session_state["dispatch_mode"])
+        st.session_state["outbox"] = (_m + st.session_state["outbox"])[:14]
+    ph_outbox.markdown(outbox_html(st.session_state["outbox"]), unsafe_allow_html=True)
+
     # ── Bottom: telemetry ────────────────────────────────────────────────────
     st.markdown('<div class="section-header">Edge Hardware Telemetry</div>',
                 unsafe_allow_html=True)
@@ -663,12 +895,27 @@ def run_dashboard(processors: list[ZoneProcessor]):
     executor = _get_executor()
 
     # ═══════════════════════════════════════════════════════════════════════════
-    #  LIVE UPDATE LOOP — only placeholders are updated, no DOM rebuild
+    #  LIVE UPDATE — st.fragment(run_every) reruns ONLY this block on a timer.
+    #  Because each rerun is its own script execution, charts can use STABLE keys
+    #  → Streamlit patches them in place instead of destroying+rebuilding the
+    #  iframe every tick. That is what removes the flicker and the page-jump that
+    #  the old infinite while-loop caused.
     # ═══════════════════════════════════════════════════════════════════════════
-    while st.session_state.processors is not None:
-        
-        # Parallel frame processing across all cameras using ThreadPoolExecutor
-        futures = [executor.submit(p.process_frame) for p in processors]
+    @st.fragment(run_every="0.15s")
+    def live_tick():
+        if st.session_state.get("processors") is None:
+            return
+
+        # Round-robin the HEAVY counting: only one zone runs DM-Count inference
+        # per tick; the others reuse their last density map but still update
+        # motion/risk/forecast/display. This ~3x's the update rate (one heavy
+        # inference per tick instead of three) and shrinks the rerun dim-window.
+        n = len(processors)
+        rr = st.session_state.get("_rr", 0)
+        active = rr % n if n else 0
+        st.session_state["_rr"] = rr + 1
+        futures = [executor.submit(p.process_frame, i == active)
+                   for i, p in enumerate(processors)]
         states: list[ZoneState] = [f.result() for f in futures]
         
         # Module 6: Urgency-weighted GRS
@@ -716,6 +963,48 @@ def run_dashboard(processors: list[ZoneProcessor]):
         🔄 Live &nbsp;·&nbsp; {time.strftime("%H:%M:%S")}
         </span></div>""", unsafe_allow_html=True)
 
+        # ── ♿ Module 8: Accessible Command Channel ──────────────────────────
+        # One redundant, multi-modal alert: colour-blind-safe visual + shape +
+        # plain-language text + screen-reader announcement + spoken audio.
+        alert = a11y.build_alert(states)
+        if st.session_state.get("a11y_panel", True):
+            ph_a11y.markdown(
+                a11y.accessible_panel_html(alert, st.session_state.get("a11y_cb", False),
+                                           st.session_state.get("a11y_large", False)),
+                unsafe_allow_html=True)
+        else:
+            ph_a11y.empty()
+        # Announce / speak ONLY when the alert actually changes (fires once).
+        # Wrapped so an audio/component hiccup can never break the live loop.
+        tok = a11y.alert_token(alert)
+        if tok != st.session_state.get("_a11y_tok"):
+            st.session_state["_a11y_tok"] = tok
+            try:
+                want_browser = st.session_state.get("a11y_audio", False)
+                if want_browser or alert["level"] != "SAFE":
+                    with ph_announce:
+                        components.html(
+                            a11y.announce_component_html(alert, tok, want_browser,
+                                                         st.session_state.get("a11y_rate", 1.0)),
+                            height=0)
+                if st.session_state.get("a11y_say", False) and alert.get("speak"):
+                    a11y.speak_native(alert["speak"])
+            except Exception:
+                pass
+
+        # ── Module 9: route + dispatch responder alerts (offline-simulated) ──
+        try:
+            cands = rsp.build_messages(states, st.session_state.get("roster", rsp.DEFAULT_ROSTER),
+                                       time.strftime("%H:%M:%S"))
+            fresh = rsp.filter_new(cands, st.session_state.setdefault("_rsp_last", {}),
+                                   25.0, time.time())
+            if fresh:
+                rsp.dispatch(fresh, st.session_state.get("dispatch_mode", "simulated"))
+                st.session_state["outbox"] = (fresh + st.session_state.get("outbox", []))[:14]
+        except Exception:
+            pass
+        ph_outbox.markdown(outbox_html(st.session_state.get("outbox", [])), unsafe_allow_html=True)
+
         # Danger Banner — shows dominant cause and gate action (Module 3/4)
         danger_zones = [s for s in states if s.status == "DANGER"]
         if danger_zones:
@@ -746,7 +1035,32 @@ def run_dashboard(processors: list[ZoneProcessor]):
                 unsafe_allow_html=True,
             )
         else:
-            ph_danger_banner.empty()
+            # ── Module 7: PREDICTIVE pre-alert ────────────────────────────────
+            # No zone is in DANGER yet, but the forecast projects a crossing.
+            # This is the whole point of the predictive layer: warn *before*
+            # the crush, while there is still time to act.
+            rising = [
+                s for s in states
+                if getattr(s, "eta_danger_seconds", None) is not None
+            ]
+            rising.sort(key=lambda s: s.eta_danger_seconds)
+            if rising:
+                parts = [
+                    f"<strong>{s.label}</strong> → DANGER in ~{s.eta_danger_seconds:.0f}s "
+                    f"(risk {s.risk:.2f}, rising)"
+                    for s in rising[:3]
+                ]
+                pre_msg = "⏱ &nbsp;FORECAST: " + " &nbsp;|&nbsp; ".join(parts)
+                ph_danger_banner.markdown(
+                    f"<div style='background:linear-gradient(90deg,#78350f,#b45309);"
+                    f"color:#fff;padding:12px 20px;border-radius:10px;font-weight:700;"
+                    f"font-size:13px;text-align:center;margin-bottom:16px;"
+                    f"border:1px solid rgba(245,158,11,0.4);'>{pre_msg} "
+                    f"&nbsp;·&nbsp; <span style='font-weight:500'>act now to prevent escalation</span></div>",
+                    unsafe_allow_html=True,
+                )
+            else:
+                ph_danger_banner.empty()
 
         # Video feeds
         for i, s in enumerate(states):
@@ -754,15 +1068,19 @@ def run_dashboard(processors: list[ZoneProcessor]):
             if s.frame_rgb is not None:
                 thumb = cv2.resize(s.frame_rgb, (400, 225))
                 ph_videos[i].image(thumb, width="stretch")
-            ph_zone_info[i].markdown(zone_info_html(s), unsafe_allow_html=True)
+            ph_zone_info[i].markdown(
+                zone_info_html(s, st.session_state.get("a11y_cb", False)),
+                unsafe_allow_html=True)
 
-        # GRS gauge — direct placeholder call (no container wrapper = no flicker)
+        # Charts use STABLE keys — safe now that each fragment rerun is its own
+        # script run (one element per key per run). Streamlit patches them in
+        # place across reruns → no iframe remount, no flicker, no page-jump.
         tick = st.session_state.tick
         ph_gauge.plotly_chart(
             make_gauge(grs, "GRS", grs_color),
             use_container_width=True,
             config={"displayModeBar": False},
-            key=f"grs_gauge_{tick}",
+            key="grs_gauge",
         )
 
         # Zone triage — compact HTML, no leading whitespace (avoids markdown code-block bug)
@@ -805,18 +1123,18 @@ def run_dashboard(processors: list[ZoneProcessor]):
                         f"</div>")
         ph_marshal.markdown(marshal_html, unsafe_allow_html=True)
 
-        # Charts — direct placeholder call (no container wrapper = no flicker)
+        # Timeline + causal charts — stable keys, patched in place (no flicker)
         ph_timeline.plotly_chart(
             make_risk_chart(states),
             use_container_width=True,
             config={"displayModeBar": False},
-            key=f"risk_timeline_{tick}",
+            key="risk_timeline",
         )
         ph_causal.plotly_chart(
             make_causal_chart(states),
             use_container_width=True,
             config={"displayModeBar": False},
-            key=f"causal_chart_{tick}",
+            key="causal_chart",
         )
 
         # Gate status panel — compact single-line HTML, no leading spaces
@@ -872,6 +1190,9 @@ def run_dashboard(processors: list[ZoneProcessor]):
                 unsafe_allow_html=True,
             )
 
+    # Kick off the auto-refreshing live fragment (reruns itself every run_every).
+    live_tick()
+
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 def main():
@@ -880,20 +1201,38 @@ def main():
         st.session_state.plc_started = True
 
     if start_btn:
-        with st.spinner("Initializing neural engine and allocating threaded streams..."):
+        with st.spinner("Initializing counting engine and allocating threaded streams..."):
             try:
-                model = load_model(MODEL_PATH)
+                # Build the selected counting engine ONCE, shared across zones.
+                model, counter = None, None
+                if count_engine == "dmcount":
+                    if not Path(DMCOUNT_WEIGHTS).exists():
+                        st.error(f"DM-Count weights not found at {DMCOUNT_WEIGHTS}. "
+                                 f"Place model_qnrf.pth in models/ or switch to YOLO.")
+                        return
+                    counter = load_dmcount(DMCOUNT_WEIGHTS, dm_res)
+                    counter.set_longest_side(dm_res)
+                    st.session_state.dm_device = str(counter.device)
+                else:
+                    model = load_model(MODEL_PATH)
+
                 zones = [
                     ("zone_a", ZONE_LABELS["zone_a"], VIDEO_A),
                     ("zone_b", ZONE_LABELS["zone_b"], VIDEO_B),
                     ("zone_c", ZONE_LABELS["zone_c"], VIDEO_C),
                 ]
                 processors = []
+                # In DM-Count mode the fragment cadence + round-robin pace the
+                # work, so process every frame we read (frame_skip=1 via a high
+                # target_fps) and let round-robin (not the interval) gate counting.
+                tfps = 60 if count_engine == "dmcount" else target_fps
                 for zid, zlabel, vpath in zones:
                     if is_valid_source(vpath):
                         processors.append(ZoneProcessor(
-                            zid, zlabel, vpath, model,
-                            conf=conf_thresh, imgsz=imgsz, target_fps=target_fps,
+                            zid, zlabel, vpath, model=model, counter=counter,
+                            count_mode=count_engine, capacity=capacity,
+                            conf=conf_thresh, imgsz=imgsz, target_fps=tfps,
+                            count_min_interval=0.1,
                         ))
                     else:
                         st.sidebar.warning(f"⚠ {zlabel}: source not found — {vpath}")
