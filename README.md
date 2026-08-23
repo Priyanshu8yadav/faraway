@@ -131,7 +131,7 @@ Python · PyTorch (DM-Count) · OpenCV (optical flow) · Streamlit + Plotly (das
 
 ## 👥 Team
 
-**Priyanshu Kumar Yadav** · **Abhinav Kumar Mishra**
+**Priyanshu Kumar Yadav** · **Abhinav Kumar Mishra** · **Sarvesh Tiwari** · **Nagendra Mishra**
 Computer Science & Engineering, Rajkiya Engineering College, Mainpuri.
 
 ## 📄 License
